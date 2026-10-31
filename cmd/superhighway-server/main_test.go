@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -8,9 +9,15 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+)
+
+const (
+	testUser = "alice"
+	testPass = "PW123"
 )
 
 func TestValidateFSFlag(t *testing.T) {
@@ -45,24 +52,57 @@ func TestValidateFSFlag(t *testing.T) {
 	}
 }
 
-func newTestServer(t *testing.T) (*httptest.Server, string) {
+func TestSanitizeAndValidateUsername(t *testing.T) {
+	if got := SanitizeUsername("ca\x07f\n\x7fé"); got != "caf" {
+		t.Errorf("SanitizeUsername = %q, want \"caf\"", got)
+	}
+
+	valid := []string{
+		"a",
+		"alice",
+		"bob_123-xyz",
+		"ca\x07fé", // sanitizes to "caf"
+		strings.Repeat("x", 32),
+	}
+	for _, u := range valid {
+		if !ValidateUsername(u) {
+			t.Errorf("ValidateUsername(%q) = false, want true", u)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"\x00\x07\x7f", // empty after stripping outside 32..126
+		strings.Repeat("x", 33),
+	}
+	for _, u := range invalid {
+		if ValidateUsername(u) {
+			t.Errorf("ValidateUsername(%q) = true, want false", u)
+		}
+	}
+}
+
+func newTestServer(t *testing.T) (*httptest.Server, string, *bytes.Buffer) {
 	t.Helper()
 	tmp := t.TempDir()
 	fsDir := filepath.Join(tmp, "fs") + "/"
 	if err := os.MkdirAll(fsDir, 0755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	srv, err := NewServer(fsDir)
+	srv, err := NewServer(fsDir, testPass)
 	if err != nil {
 		t.Fatalf("NewServer(%q): %v", fsDir, err)
 	}
+	var auditBuf bytes.Buffer
+	srv.auditWriter = &auditBuf
+
 	t.Cleanup(func() { _ = srv.Close() })
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
-	return ts, fsDir
+	return ts, fsDir, &auditBuf
 }
 
-func doReq(t *testing.T, method, targetURL, body string) (int, string, http.Header) {
+func doReqAuth(t *testing.T, method, targetURL, user, pass, body string) (int, string, http.Header) {
 	t.Helper()
 	var bodyReader io.Reader
 	if body != "" {
@@ -71,6 +111,9 @@ func doReq(t *testing.T, method, targetURL, body string) (int, string, http.Head
 	req, err := http.NewRequest(method, targetURL, bodyReader)
 	if err != nil {
 		t.Fatalf("NewRequest(%s %s): %v", method, targetURL, err)
+	}
+	if user != "" || pass != "" {
+		req.SetBasicAuth(user, pass)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -84,8 +127,97 @@ func doReq(t *testing.T, method, targetURL, body string) (int, string, http.Head
 	return resp.StatusCode, string(b), resp.Header
 }
 
+func doReq(t *testing.T, method, targetURL, body string) (int, string, http.Header) {
+	t.Helper()
+	return doReqAuth(t, method, targetURL, testUser, testPass, body)
+}
+
+func TestAuthAndAuditLog(t *testing.T) {
+	ts, _, auditBuf := newTestServer(t)
+
+	// 1. Missing Basic Auth -> 418 I'm a teapot, no audit log
+	code, _, _ := doReqAuth(t, "LS", ts.URL+"/", "", "", "")
+	if code != http.StatusTeapot {
+		t.Fatalf("no auth: got %d, want %d (418)", code, http.StatusTeapot)
+	}
+
+	// 2. Wrong password -> 418 I'm a teapot, no audit log
+	code, _, _ = doReqAuth(t, http.MethodPut, ts.URL+"/x.txt", "alice", "wrong", "hello")
+	if code != http.StatusTeapot {
+		t.Fatalf("wrong pass: got %d, want %d (418)", code, http.StatusTeapot)
+	}
+
+	// 3. Username > 32 chars -> 418 I'm a teapot, no audit log
+	code, _, _ = doReqAuth(t, "LS", ts.URL+"/", strings.Repeat("a", 33), testPass, "")
+	if code != http.StatusTeapot {
+		t.Fatalf("long user: got %d, want %d (418)", code, http.StatusTeapot)
+	}
+
+	// 4. Username with only non-printable chars -> 418 I'm a teapot, no audit log
+	code, _, _ = doReqAuth(t, "LS", ts.URL+"/", "\x00\x07\x7f", testPass, "")
+	if code != http.StatusTeapot {
+		t.Fatalf("empty-after-sanitize user: got %d, want %d (418)", code, http.StatusTeapot)
+	}
+
+	if auditBuf.Len() != 0 {
+		t.Fatalf("expected empty audit log after auth failures, got:\n%s", auditBuf.String())
+	}
+
+	// 5. Non-changing reads (LS, DU) -> 200 OK, no audit log
+	code, _, _ = doReq(t, "LS", ts.URL+"/", "")
+	if code != http.StatusOK {
+		t.Fatalf("LS /: got %d, want 200", code)
+	}
+	code, _, _ = doReq(t, "DU", ts.URL+"/", "")
+	if code != http.StatusOK {
+		t.Fatalf("DU /: got %d, want 200", code)
+	}
+	if auditBuf.Len() != 0 {
+		t.Fatalf("expected empty audit log after non-changing reads, got:\n%s", auditBuf.String())
+	}
+
+	// 6. Mutating requests (MKDIR, PUT, RM, RMDIR) -> logged as CSV starting with "csv,"
+	code, _, _ = doReqAuth(t, "MKDIR", ts.URL+"/sub", "b\x07obé", testPass, "")
+	if code != http.StatusCreated {
+		t.Fatalf("MKDIR /sub: got %d, want 201", code)
+	}
+	code, _, _ = doReqAuth(t, http.MethodPut, ts.URL+"/sub/f.txt", "carol", testPass, "data")
+	if code != http.StatusCreated {
+		t.Fatalf("PUT /sub/f.txt: got %d, want 201", code)
+	}
+	// GET (read) should not add a log line
+	code, _, _ = doReqAuth(t, http.MethodGet, ts.URL+"/sub/f.txt", "carol", testPass, "")
+	if code != http.StatusOK {
+		t.Fatalf("GET /sub/f.txt: got %d, want 200", code)
+	}
+	code, _, _ = doReqAuth(t, "RM", ts.URL+"/sub/f.txt", "dave", testPass, "")
+	if code != http.StatusOK {
+		t.Fatalf("RM /sub/f.txt: got %d, want 200", code)
+	}
+	code, _, _ = doReqAuth(t, "RMDIR", ts.URL+"/sub", "erin", testPass, "")
+	if code != http.StatusOK {
+		t.Fatalf("RMDIR /sub: got %d, want 200", code)
+	}
+
+	logLines := strings.Split(strings.TrimSuffix(auditBuf.String(), "\n"), "\n")
+	if len(logLines) != 4 {
+		t.Fatalf("expected 4 audit log lines, got %d:\n%s", len(logLines), auditBuf.String())
+	}
+	wantSuffixes := []string{
+		`,127.0.0.1,bob,MKDIR,/sub`,
+		`,127.0.0.1,carol,PUT,/sub/f.txt`,
+		`,127.0.0.1,dave,RM,/sub/f.txt`,
+		`,127.0.0.1,erin,RMDIR,/sub`,
+	}
+	for i, wantSuffix := range wantSuffixes {
+		if !strings.HasPrefix(logLines[i], "csv,") || !strings.HasSuffix(logLines[i], wantSuffix) {
+			t.Errorf("logLines[%d] = %q, want prefix \"csv,\" and suffix %q", i, logLines[i], wantSuffix)
+		}
+	}
+}
+
 func TestFilesystemLifecycle(t *testing.T) {
-	ts, fsDir := newTestServer(t)
+	ts, fsDir, _ := newTestServer(t)
 
 	// 1. MKDIR /docs
 	code, body, _ := doReq(t, "MKDIR", ts.URL+"/docs", "")
@@ -183,7 +315,7 @@ func TestFilesystemLifecycle(t *testing.T) {
 }
 
 func TestSymlinkEscapeBlocked(t *testing.T) {
-	ts, fsDir := newTestServer(t)
+	ts, fsDir, _ := newTestServer(t)
 
 	// Create a secret file outside fsDir
 	outsideFile := filepath.Join(filepath.Dir(strings.TrimSuffix(fsDir, "/")), "secret.txt")
@@ -200,5 +332,41 @@ func TestSymlinkEscapeBlocked(t *testing.T) {
 	code, _, _ := doReq(t, http.MethodGet, ts.URL+"/escape.txt", "")
 	if code == http.StatusOK {
 		t.Fatalf("GET /escape.txt succeeded across symlink boundary, expected error")
+	}
+}
+
+func TestTimeMethod(t *testing.T) {
+	ts, _, auditBuf := newTestServer(t)
+
+	before := time.Now().UTC().Unix()
+	code, body, _ := doReq(t, "TIME", ts.URL+"/", "")
+	after := time.Now().UTC().Unix()
+
+	if code != http.StatusOK {
+		t.Fatalf("TIME /: got %d (%s), want 200", code, body)
+	}
+	if auditBuf.Len() != 0 {
+		t.Fatalf("TIME should not write to audit log, got: %s", auditBuf.String())
+	}
+
+	line := strings.TrimSuffix(body, "\n")
+	fields := strings.Split(line, " ")
+	if len(fields) != 3 {
+		t.Fatalf("TIME response = %q, expected 3 space-separated fields (YYYY-mm-dd HH:MM:SS unix_sec)", line)
+	}
+	friendly := fields[0] + " " + fields[1]
+	parsedTime, err := time.Parse(timeFormat, friendly)
+	if err != nil {
+		t.Fatalf("Parse(%q): %v", friendly, err)
+	}
+	unixSec, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil {
+		t.Fatalf("ParseInt(%q): %v", fields[2], err)
+	}
+	if parsedTime.Unix() != unixSec {
+		t.Errorf("friendly time unix (%d) != unix_sec field (%d)", parsedTime.Unix(), unixSec)
+	}
+	if unixSec < before-2 || unixSec > after+2 {
+		t.Errorf("unixSec = %d outside expected window [%d, %d]", unixSec, before-2, after+2)
 	}
 }

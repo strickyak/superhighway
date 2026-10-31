@@ -8,7 +8,7 @@ The protocol is designed to be stateless, human-debuggable, and minimal—requir
 
 ---
 
-## 2. Addressing & URL Path Encoding
+## 2. Addressing, Authentication & URL Path Encoding
 
 ### 2.1 Base URL
 A client is configured with a server base URL:
@@ -17,7 +17,13 @@ http://<host>:<port>
 ```
 (Optionally with a path prefix if reverse-proxied, though typically rooted at `/`.)
 
-### 2.2 Remote Path Normalization & Escaping
+### 2.2 HTTP Basic Authentication
+Every request must include an HTTP Basic Authentication header (`Authorization: Basic <base64(user:password)>`):
+- **Username**: Any non-empty ASCII string up to 32 characters (`1 <= len(user) <= 32` after deleting any bytes outside `32..126`, excluding `:`). The server records this sanitized username in its stderr CSV audit log (`csv,<timestamp>,<ip>,<user>,<op>,<path>`) whenever a mutating operation (`PUT`, `RM`/`DELETE`, `MKDIR`/`MKCOL`, `RMDIR`) succeeds.
+- **Password**: Must match the server's `--password` flag value.
+- **Authentication Failure**: If credentials are missing, the username is invalid, or the password does not match, the server responds with **`418 I'm a teapot`** (instead of `401 Unauthorized`) and does not log the failed attempt.
+
+### 2.3 Remote Path Normalization & Escaping
 - Remote paths are POSIX-style paths starting with `/` (e.g., `/`, `/docs`, `/docs/hello.txt`).
 - Path traversal segments (`..`) and NUL bytes (`\x00`) are forbidden and rejected by the server with `400 Bad Request`.
 - **Percent-encoding is required on the wire**: Because filenames may contain spaces, `#`, `?`, `%`, and other reserved URL characters (e.g. `Filename might have spaces and #@%$%? funny chars!`), the client **must** RFC 3986 percent-encode path segments when constructing the HTTP request target:
@@ -124,6 +130,18 @@ All requests target `<base_url><escaped_remote_path>`.
   37
   ```
 
+### 3.9 `TIME` — Current Server Time
+- **Request**:
+  ```http
+  TIME / HTTP/1.1
+  ```
+  *(Aliases accepted by server: `NOW`, `DATE`)*
+- **Success Response**: `200 OK`, `Content-Type: text/plain; charset=utf-8`
+- **Response Body**: A single `\n`-terminated line containing the friendly UTC timestamp (`YYYY-mm-dd HH:MM:SS`) followed by a space and Unix epoch seconds (accuracy ± a couple of seconds):
+  ```text
+  2026-10-31 21:44:02 1793483042
+  ```
+
 ---
 
 ## 4. Parsing Specifications
@@ -147,6 +165,11 @@ Each line (with trailing `\n` or `\r\n` stripped) has the grammar:
 ### 4.2 Parsing `DU` Output
 - Trim leading/trailing whitespace from the response body and parse as a base-10 `int64`.
 
+### 4.3 Parsing `TIME` Output
+- Trim trailing `\n` / `\r\n` and split on ASCII spaces (`' '`):
+  - Field 1 (`YYYY-mm-dd`) + `" "` + Field 2 (`HH:MM:SS`): friendly UTC timestamp.
+  - Field 3: base-10 Unix epoch seconds (`int64`).
+
 ---
 
 ## 5. Error Handling
@@ -161,6 +184,7 @@ When the server returns a non-`2xx` status code, the response body is a plain-te
 | `404 Not Found` | Path (or parent directory) does not exist (`fs.ErrNotExist`) |
 | `405 Method Not Allowed` | Unknown HTTP method |
 | `409 Conflict` | Target already exists (`fs.ErrExist`) or `PUT` target is a directory |
+| `418 I'm a teapot` | Authentication failed (missing Basic Auth, invalid username, or wrong password) |
 
 ---
 
@@ -185,11 +209,13 @@ type Entry struct {
 }
 
 type Client struct {
-	BaseURL    string       // e.g. "http://localhost:8080"
+	BaseURL    string       // e.g. "http://localhost:1908"
+	Username   string       // 1..32 printable ASCII chars
+	Password   string       // Must match server --password
 	HTTPClient *http.Client // Optional; defaults to http.DefaultClient
 }
 
-func New(baseURL string) *Client
+func New(baseURL, username, password string) *Client
 
 func (c *Client) LS(ctx context.Context, remotePath string) ([]Entry, error)
 func (c *Client) Get(ctx context.Context, remotePath string) (io.ReadCloser, error)
@@ -198,6 +224,7 @@ func (c *Client) RM(ctx context.Context, remotePath string) error
 func (c *Client) Mkdir(ctx context.Context, remotePath string, parents bool) error
 func (c *Client) Rmdir(ctx context.Context, remotePath string) error
 func (c *Client) DU(ctx context.Context, remotePath string) (int64, error)
+func (c *Client) Time(ctx context.Context) (friendlyUTC string, unixSec int64, err error)
 ```
 
 ### 6.2 CLI Subcommands (Optional CLI Wrapper)
@@ -209,3 +236,4 @@ A command-line client binary (e.g., `shwy --url=http://localhost:8080 <cmd> [arg
 - `shwy rmdir /remote/dir` — Remove empty directory
 - `shwy rm /remote/file` — Remove file
 - `shwy du [/path]` — Print recursive byte usage of `/path` (defaults to `/`)
+- `shwy time` — Print server UTC time and Unix seconds
