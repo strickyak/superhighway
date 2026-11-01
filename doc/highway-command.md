@@ -5,7 +5,7 @@
 ## Synopsis
 
 ```bash
-go run ./cmd/highway -fs <dir/fs/> -url 'http://<user>:<password>@<host>:<port>/' -c <download|upload> [-all] [-delete] [-v]
+go run ./cmd/highway -fs <dir/fs/> -url 'http://<user>:<password>@<host>:<port>/' -c <download|upload> [-all] [-delete] [-n] [-v]
 ```
 
 ## Flags
@@ -17,7 +17,8 @@ go run ./cmd/highway -fs <dir/fs/> -url 'http://<user>:<password>@<host>:<port>/
 | `-c` | Yes | *(none)* | Sync direction: `download` (remote $\to$ local) or `upload` (local $\to$ remote). |
 | `-all` | No | `false` | Force all files to be transferred and overwritten, even if byte sizes match. |
 | `-delete` | No | `false` | Delete files and directories in the destination that do not exist in the source. |
-| `-v` | No | `false` | Log every HTTP request (`<METHOD> <URL>`) sent to the server to `stderr`. |
+| `-n` | No | `false` | Dry-run: perform no changes; combine with `-v` to print actions that would take place. |
+| `-v` | No | `false` | Log every HTTP request (`<METHOD> <URL>`) and local delete action to `stderr`. |
 
 ## Examples
 

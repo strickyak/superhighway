@@ -240,7 +240,9 @@ func (s *Server) handleLS(w http.ResponseWriter, r *http.Request, rel string) {
 		if r.Method == http.MethodHead {
 			return
 		}
+		fmt.Fprint(w, "1\n")
 		fmt.Fprint(w, formatLSEntry(info.Name(), info))
+		fmt.Fprint(w, ";\n")
 		return
 	}
 
@@ -264,13 +266,20 @@ func (s *Server) handleLS(w http.ResponseWriter, r *http.Request, rel string) {
 		return
 	}
 
+	lines := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		eInfo, err := entry.Info()
 		if err != nil {
 			continue
 		}
-		fmt.Fprint(w, formatLSEntry(entry.Name(), eInfo))
+		lines = append(lines, formatLSEntry(entry.Name(), eInfo))
 	}
+
+	fmt.Fprintf(w, "%d\n", len(lines))
+	for _, line := range lines {
+		fmt.Fprint(w, line)
+	}
+	fmt.Fprint(w, ";\n")
 }
 
 func formatLSEntry(name string, info fs.FileInfo) string {

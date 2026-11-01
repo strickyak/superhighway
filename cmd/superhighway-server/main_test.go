@@ -259,18 +259,24 @@ func TestFilesystemLifecycle(t *testing.T) {
 		t.Fatalf("LS /: got %d (%s), want 200", code, body)
 	}
 	lines := strings.Split(strings.TrimSuffix(body, "\n"), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("LS / expected 2 lines, got %d:\n%s", len(lines), body)
+	if len(lines) != 4 {
+		t.Fatalf("LS / expected 4 lines (count, 2 entries, ';'), got %d:\n%s", len(lines), body)
+	}
+	if lines[0] != "2" {
+		t.Errorf("LS line[0] (count) = %q, want \"2\"", lines[0])
 	}
 
 	wantFunnyLine := "2026-10-31 21:05:09 16 " + funnyName
-	if lines[0] != wantFunnyLine {
-		t.Errorf("LS line[0] = %q, want %q", lines[0], wantFunnyLine)
+	if lines[1] != wantFunnyLine {
+		t.Errorf("LS line[1] = %q, want %q", lines[1], wantFunnyLine)
 	}
 
 	dirRe := regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \d+ docs/$`)
-	if !dirRe.MatchString(lines[1]) {
-		t.Errorf("LS line[1] = %q, did not match %v", lines[1], dirRe)
+	if !dirRe.MatchString(lines[2]) {
+		t.Errorf("LS line[2] = %q, did not match %v", lines[2], dirRe)
+	}
+	if lines[3] != ";" {
+		t.Errorf("LS line[3] (terminator) = %q, want \";\"", lines[3])
 	}
 
 	// 6. DU on "/" and "/docs"

@@ -43,13 +43,18 @@ All requests target `<base_url><escaped_remote_path>`.
   ```
   *(Aliases accepted by server: `LIST`, or `GET` when the target is a directory.)*
 - **Success Response**: `200 OK`, `Content-Type: text/plain; charset=utf-8`
-- **Response Body**: Zero or more `\n`-terminated lines sorted lexicographically by entry name:
+- **Response Body**:
+  - An initial line with the base-10 integer count of entries (`<count>\n`), counting both files and directories.
+  - `<count>` `\n`-terminated entry lines sorted lexicographically by entry name.
+  - A final terminator line containing only `;` (`;\n`).
   ```text
+  2
   2026-10-31 21:05:09 16 Filename might have spaces and #@%$%? funny chars!
   2026-10-31 21:05:09 4096 docs/
+  ;
   ```
-  - If the target is an empty directory, the response body is empty (`0` bytes).
-  - If the target is a single regular file, a single line is returned for that file's base name.
+  - If the target is an empty directory, the response body is `0\n;\n`.
+  - If the target is a single regular file, `<count>` is `1`, followed by that file's entry line and `;\n`.
 
 ### 3.2 `GET` — Read File Contents
 - **Request**:
@@ -146,20 +151,24 @@ All requests target `<base_url><escaped_remote_path>`.
 
 ## 4. Parsing Specifications
 
-### 4.1 Parsing `LS` Lines
-Each line (with trailing `\n` or `\r\n` stripped) has the grammar:
+### 4.1 Parsing `LS` Output
+1. **Header & Footer Framing**:
+   - Line 1: Base-10 integer `<count>` (`>= 0`), the total number of files and directories that follow.
+   - Next `<count>` lines: One line per entry.
+   - Final line: Must be exactly `;` (verifying the listing was not truncated).
+2. **Entry Line Grammar** (with trailing `\n` or `\r\n` stripped):
 ```text
 <YYYY-mm-dd> <HH:MM:SS> <size> <name>[/]
 ```
-1. **Split on the first 3 ASCII spaces (`' '`)**:
-   - Field 1 (`10` chars): Date in UTC (`YYYY-mm-dd`).
-   - Field 2 (`8` chars): Time in UTC (`HH:MM:SS`).
-   - Field 3 (`1+` digits): Decimal integer `<size>` in bytes (`int64`).
-   - Field 4 (remainder of line): Entry name, with `/` appended if and only if the entry is a directory.
-2. **Directory Detection**:
+   - **Split on the first 3 ASCII spaces (`' '`)**:
+     - Field 1 (`10` chars): Date in UTC (`YYYY-mm-dd`).
+     - Field 2 (`8` chars): Time in UTC (`HH:MM:SS`).
+     - Field 3 (`1+` digits): Decimal integer `<size>` in bytes (`int64`).
+     - Field 4 (remainder of line): Entry name, with `/` appended if and only if the entry is a directory.
+3. **Directory Detection**:
    - Since POSIX filenames cannot contain `/`, a trailing `/` on Field 4 unambiguously indicates `IsDir = true`.
    - Strip the trailing `/` to obtain the clean entry name.
-3. **Why splitting on the first 3 spaces is exact**:
+4. **Why splitting on the first 3 spaces is exact**:
    - Even if a filename begins with a space, contains multiple consecutive spaces, or contains arbitrary punctuation (`#@%$%?`), everything after the space following `<size>` belongs verbatim to the filename.
 
 ### 4.2 Parsing `DU` Output

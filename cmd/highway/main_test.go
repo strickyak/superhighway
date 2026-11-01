@@ -35,6 +35,24 @@ func TestParseLSLine(t *testing.T) {
 	if d.Name != "my dir" || !d.IsDir {
 		t.Errorf("got %+v", d)
 	}
+
+	// Test full ParseLS with count and ';' terminator
+	fullBody := "2\n" + line + "\n" + dirLine + "\n;\n"
+	entries, err := ParseLS(fullBody)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("ParseLS got (%d entries, %v), want 2 entries", len(entries), err)
+	}
+	emptyBody := "0\n;\n"
+	emptyEntries, err := ParseLS(emptyBody)
+	if err != nil || len(emptyEntries) != 0 {
+		t.Fatalf("ParseLS(empty) got (%v, %v), want 0 entries", emptyEntries, err)
+	}
+	if _, err := ParseLS("2\n" + line + "\n;\n"); err == nil {
+		t.Errorf("expected error for count mismatch, got nil")
+	}
+	if _, err := ParseLS("1\n" + line + "\n"); err == nil {
+		t.Errorf("expected error for missing ';' terminator, got nil")
+	}
 }
 
 // mockSuperhighwayServer implements the server protocol in-process for testing highway sync
@@ -66,7 +84,7 @@ func (m *mockSuperhighwayServer) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		if !info.IsDir() {
-			fmt.Fprintf(w, "%s %d %s\n", info.ModTime().UTC().Format(timeFormat), info.Size(), info.Name())
+			fmt.Fprintf(w, "1\n%s %d %s\n;\n", info.ModTime().UTC().Format(timeFormat), info.Size(), info.Name())
 			return
 		}
 		f, err := m.root.Open(rel)
@@ -79,6 +97,7 @@ func (m *mockSuperhighwayServer) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		slices.SortFunc(entries, func(a, b os.DirEntry) int {
 			return strings.Compare(a.Name(), b.Name())
 		})
+		var lines []string
 		for _, entry := range entries {
 			ei, err := entry.Info()
 			if err != nil {
@@ -88,8 +107,13 @@ func (m *mockSuperhighwayServer) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			if ei.IsDir() {
 				suffix = "/"
 			}
-			fmt.Fprintf(w, "%s %d %s%s\n", ei.ModTime().UTC().Format(timeFormat), ei.Size(), entry.Name(), suffix)
+			lines = append(lines, fmt.Sprintf("%s %d %s%s\n", ei.ModTime().UTC().Format(timeFormat), ei.Size(), entry.Name(), suffix))
 		}
+		fmt.Fprintf(w, "%d\n", len(lines))
+		for _, l := range lines {
+			fmt.Fprint(w, l)
+		}
+		fmt.Fprint(w, ";\n")
 
 	case "MKDIR":
 		if r.URL.Query().Get("p") == "1" {
@@ -206,7 +230,7 @@ func TestUploadAndDownloadSync(t *testing.T) {
 	}
 
 	// 1. Initial upload: should PUT 2 files
-	if err := Run(srcFS, authURL, "upload", false, false, false); err != nil {
+	if err := Run(Config{FS: srcFS, URL: authURL, Cmd: "upload"}); err != nil {
 		t.Fatalf("Run upload 1: %v", err)
 	}
 	if got := mockSrv.putCount.Load(); got != 2 {
@@ -215,15 +239,15 @@ func TestUploadAndDownloadSync(t *testing.T) {
 
 	// 2. Second upload with no size changes: should PUT 0 files
 	mockSrv.putCount.Store(0)
-	if err := Run(srcFS, authURL, "upload", false, false, false); err != nil {
+	if err := Run(Config{FS: srcFS, URL: authURL, Cmd: "upload"}); err != nil {
 		t.Fatalf("Run upload 2: %v", err)
 	}
 	if got := mockSrv.putCount.Load(); got != 0 {
 		t.Fatalf("putCount after unchanged upload = %d, want 0", got)
 	}
 
-	// 2b. Upload with forceAll=true (-all): should PUT all 2 files even with identical sizes
-	if err := Run(srcFS, authURL, "upload", true, false, false); err != nil {
+	// 2b. Upload with All=true (-all): should PUT all 2 files even with identical sizes
+	if err := Run(Config{FS: srcFS, URL: authURL, Cmd: "upload", All: true}); err != nil {
 		t.Fatalf("Run upload -all: %v", err)
 	}
 	if got := mockSrv.putCount.Load(); got != 2 {
@@ -235,7 +259,7 @@ func TestUploadAndDownloadSync(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(srcFS, "a.txt"), []byte("hello world!"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := Run(srcFS, authURL, "upload", false, false, false); err != nil {
+	if err := Run(Config{FS: srcFS, URL: authURL, Cmd: "upload"}); err != nil {
 		t.Fatalf("Run upload 3: %v", err)
 	}
 	if got := mockSrv.putCount.Load(); got != 1 {
@@ -243,7 +267,7 @@ func TestUploadAndDownloadSync(t *testing.T) {
 	}
 
 	// 4. Initial download into dstFS: should GET 2 files
-	if err := Run(dstFS, authURL, "download", false, false, false); err != nil {
+	if err := Run(Config{FS: dstFS, URL: authURL, Cmd: "download"}); err != nil {
 		t.Fatalf("Run download 1: %v", err)
 	}
 	if got := mockSrv.getCount.Load(); got != 2 {
@@ -262,15 +286,15 @@ func TestUploadAndDownloadSync(t *testing.T) {
 
 	// 5. Second download with no size changes: should GET 0 files
 	mockSrv.getCount.Store(0)
-	if err := Run(dstFS, authURL, "download", false, false, false); err != nil {
+	if err := Run(Config{FS: dstFS, URL: authURL, Cmd: "download"}); err != nil {
 		t.Fatalf("Run download 2: %v", err)
 	}
 	if got := mockSrv.getCount.Load(); got != 0 {
 		t.Fatalf("getCount after unchanged download = %d, want 0", got)
 	}
 
-	// 5b. Download with forceAll=true (-all): should GET all 2 files even with identical sizes
-	if err := Run(dstFS, authURL, "download", true, false, false); err != nil {
+	// 5b. Download with All=true (-all): should GET all 2 files even with identical sizes
+	if err := Run(Config{FS: dstFS, URL: authURL, Cmd: "download", All: true}); err != nil {
 		t.Fatalf("Run download -all: %v", err)
 	}
 	if got := mockSrv.getCount.Load(); got != 2 {
@@ -282,7 +306,7 @@ func TestUploadAndDownloadSync(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(serverFS, "sub", "deep", funnyName), []byte("short"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := Run(dstFS, authURL, "download", false, false, false); err != nil {
+	if err := Run(Config{FS: dstFS, URL: authURL, Cmd: "download"}); err != nil {
 		t.Fatalf("Run download 3: %v", err)
 	}
 	if got := mockSrv.getCount.Load(); got != 1 {
@@ -302,7 +326,7 @@ func TestUploadAndDownloadSync(t *testing.T) {
 	if err := os.WriteFile(extraLocalFile, []byte("delete me"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := Run(dstFS, authURL, "download", false, true, false); err != nil {
+	if err := Run(Config{FS: dstFS, URL: authURL, Cmd: "download", Delete: true}); err != nil {
 		t.Fatalf("Run download -delete: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dstFS, "obsolete_dir")); !os.IsNotExist(err) {
@@ -317,7 +341,7 @@ func TestUploadAndDownloadSync(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(extraRemoteDir, "gone.txt"), []byte("bye"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := Run(srcFS, authURL, "upload", false, true, false); err != nil {
+	if err := Run(Config{FS: srcFS, URL: authURL, Cmd: "upload", Delete: true}); err != nil {
 		t.Fatalf("Run upload -delete: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(serverFS, "stale_remote")); !os.IsNotExist(err) {
@@ -325,20 +349,16 @@ func TestUploadAndDownloadSync(t *testing.T) {
 	}
 
 	// 9. Test -v verbose logging logs every HTTP request URL sent to the server
-	client, err := NewClient(authURL)
-	if err != nil {
-		t.Fatal(err)
-	}
 	var verboseBuf bytes.Buffer
-	client.verbose = true
-	client.logWriter = &verboseBuf
-	dstRoot, err := os.OpenRoot(dstFS)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dstRoot.Close()
-	if err := SyncDownload(client, dstRoot, true, false); err != nil {
-		t.Fatalf("SyncDownload verbose: %v", err)
+	if err := Run(Config{
+		FS:        dstFS,
+		URL:       authURL,
+		Cmd:       "download",
+		All:       true,
+		Verbose:   true,
+		LogWriter: &verboseBuf,
+	}); err != nil {
+		t.Fatalf("Run download verbose: %v", err)
 	}
 	vOut := verboseBuf.String()
 	for _, wantSub := range []string{"LS " + ts.URL + "/", "GET " + ts.URL + "/a.txt"} {
@@ -347,8 +367,41 @@ func TestUploadAndDownloadSync(t *testing.T) {
 		}
 	}
 
-	// 10. Reject -fs not ending with /fs/
-	if err := Run("/tmp/bad", authURL, "download", false, false, false); err == nil {
+	// 10. Test -n -v (dry-run + verbose): prints planned PUT/GET/RM/RMDIR/DELETE-LOCAL without modifying anything
+	mockSrv.putCount.Store(0)
+	mockSrv.getCount.Store(0)
+	if err := os.WriteFile(filepath.Join(serverFS, "only_remote.txt"), []byte("keep me"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	verboseBuf.Reset()
+	if err := Run(Config{
+		FS:        srcFS,
+		URL:       authURL,
+		Cmd:       "upload",
+		All:       true,
+		Delete:    true,
+		DryRun:    true,
+		Verbose:   true,
+		LogWriter: &verboseBuf,
+	}); err != nil {
+		t.Fatalf("Run upload dry-run: %v", err)
+	}
+	if got := mockSrv.putCount.Load(); got != 0 {
+		t.Errorf("dry-run upload sent %d PUT requests, want 0", got)
+	}
+	if _, err := os.Stat(filepath.Join(serverFS, "only_remote.txt")); err != nil {
+		t.Errorf("dry-run upload -delete actually deleted only_remote.txt: %v", err)
+	}
+	dryUploadLog := verboseBuf.String()
+	for _, wantSub := range []string{"RM " + ts.URL + "/only_remote.txt", "PUT " + ts.URL + "/a.txt"} {
+		if !strings.Contains(dryUploadLog, wantSub) {
+			t.Errorf("dry-run upload log missing %q; got:\n%s", wantSub, dryUploadLog)
+		}
+	}
+
+	// 11. Reject -fs not ending with /fs/
+	if err := Run(Config{FS: "/tmp/bad", URL: authURL, Cmd: "download"}); err == nil {
 		t.Errorf("expected error for invalid -fs, got nil")
 	}
 	_ = fs.ErrNotExist
