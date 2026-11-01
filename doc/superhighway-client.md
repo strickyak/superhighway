@@ -226,14 +226,3 @@ func (c *Client) Rmdir(ctx context.Context, remotePath string) error
 func (c *Client) DU(ctx context.Context, remotePath string) (int64, error)
 func (c *Client) Time(ctx context.Context) (friendlyUTC string, unixSec int64, err error)
 ```
-
-### 6.2 CLI Subcommands (Optional CLI Wrapper)
-A command-line client binary (e.g., `shwy --url=http://localhost:8080 <cmd> [args...]`) should support:
-- `shwy ls [/path]` — List entries at `/path` (defaults to `/`)
-- `shwy get /remote/path [local_path|-]` — Download file (to `local_path` or stdout)
-- `shwy put <local_path|-> /remote/path` — Upload file (from `local_path` or stdin)
-- `shwy mkdir [-p] /remote/dir` — Create directory
-- `shwy rmdir /remote/dir` — Remove empty directory
-- `shwy rm /remote/file` — Remove file
-- `shwy du [/path]` — Print recursive byte usage of `/path` (defaults to `/`)
-- `shwy time` — Print server UTC time and Unix seconds
