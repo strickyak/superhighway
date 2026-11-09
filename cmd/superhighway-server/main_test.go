@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/base64"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -376,3 +380,182 @@ func TestTimeMethod(t *testing.T) {
 		t.Errorf("unixSec = %d outside expected window [%d, %d]", unixSec, before-2, after+2)
 	}
 }
+
+func dialTestWSPath(t *testing.T, tsURL, wsPath, user, pass string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	u, err := url.Parse(tsURL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	conn, err := net.DialTimeout("tcp", u.Host, 3*time.Second)
+	if err != nil {
+		t.Fatalf("net.Dial: %v", err)
+	}
+	auth := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+	req := fmt.Sprintf(
+		"GET %s HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"Authorization: Basic %s\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"+
+			"Sec-WebSocket-Version: 13\r\n\r\n",
+		wsPath, u.Host, auth,
+	)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		conn.Close()
+		t.Fatalf("Write handshake: %v", err)
+	}
+	br := bufio.NewReader(conn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil || !strings.Contains(statusLine, "101") {
+		conn.Close()
+		t.Fatalf("expected 101 Switching Protocols, got %q (err=%v)", statusLine, err)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			conn.Close()
+			t.Fatalf("reading response headers: %v", err)
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+	return conn, br
+}
+
+func dialTestWS(t *testing.T, tsURL, user, pass string) (net.Conn, *bufio.Reader) {
+	return dialTestWSPath(t, tsURL, "/croquet", user, pass)
+}
+
+func sendMaskedWSFrame(t *testing.T, conn net.Conn, text string) {
+	t.Helper()
+	payload := []byte(text)
+	mask := [4]byte{0x12, 0x34, 0x56, 0x78}
+	frame := []byte{0x81, byte(0x80 | len(payload)), mask[0], mask[1], mask[2], mask[3]}
+	for i, b := range payload {
+		frame = append(frame, b^mask[i&3])
+	}
+	if _, err := conn.Write(frame); err != nil {
+		t.Fatalf("Write masked frame: %v", err)
+	}
+}
+
+func readServerWSFrame(t *testing.T, r io.Reader) string {
+	t.Helper()
+	op, payload, err := wsReadFrame(r)
+	if err != nil {
+		t.Fatalf("wsReadFrame: %v", err)
+	}
+	if op != 0x01 {
+		t.Fatalf("expected text opcode 1, got %d", op)
+	}
+	return string(payload)
+}
+
+func TestCroquetWebSocketAndDeltas(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+
+	// 1. Connect Client 1 ("cyd1")
+	c1, r1 := dialTestWS(t, ts.URL, "cyd1", testPass)
+	defer c1.Close()
+
+	msg := readServerWSFrame(t, r1)
+	if msg != "YOU cyd1" {
+		t.Fatalf("c1 greeting = %q, want \"YOU cyd1\"", msg)
+	}
+
+	// Send initial pose from cyd1
+	sendMaskedWSFrame(t, c1, "POSE 10.5 -20.0 0.0 1.570 3")
+
+	// Wait briefly and verify HTTP GET /croquet snapshot has cyd1 in RAM
+	time.Sleep(30 * time.Millisecond)
+	code, snapBody, _ := doReq(t, http.MethodGet, ts.URL+"/croquet", "")
+	if code != http.StatusOK || !strings.Contains(snapBody, "STATE cyd1 10.50 -20.00 0.00 1.570 3 1") {
+		t.Fatalf("GET /croquet = %d %q, expected cyd1 state", code, snapBody)
+	}
+
+	// 2. Connect Client 2 ("cyd2") -> should immediately receive YOU cyd2 + cyd1 snapshot from RAM
+	c2, r2 := dialTestWS(t, ts.URL, "cyd2", testPass)
+	defer c2.Close()
+
+	if got := readServerWSFrame(t, r2); got != "YOU cyd2" {
+		t.Fatalf("c2 greeting = %q, want \"YOU cyd2\"", got)
+	}
+	if got := readServerWSFrame(t, r2); got != "STATE cyd1 10.50 -20.00 0.00 1.570 3 1" {
+		t.Fatalf("c2 initial snapshot = %q, want cyd1 state", got)
+	}
+
+	// 3. Client 2 moves -> Client 1 receives real-time delta
+	sendMaskedWSFrame(t, c2, "POSE -40.0 55.25 0.0 0.500 5")
+	if got := readServerWSFrame(t, r1); got != "STATE cyd2 -40.00 55.25 0.00 0.500 5 2" {
+		t.Fatalf("c1 delta from c2 = %q", got)
+	}
+
+	// 4. Client 2 disconnects -> Client 1 receives LEAVE cyd2
+	c2.Close()
+	if got := readServerWSFrame(t, r1); got != "LEAVE cyd2" {
+		t.Fatalf("c1 leave msg = %q, want \"LEAVE cyd2\"", got)
+	}
+}
+
+func TestGenericRoomAndMultiUserChatWebSocket(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+
+	// 1. Alice connects to /ws/chat
+	cAlice, rAlice := dialTestWSPath(t, ts.URL, "/ws/chat", "alice", testPass)
+	defer cAlice.Close()
+
+	if got := readServerWSFrame(t, rAlice); got != "YOU alice" {
+		t.Fatalf("alice greeting = %q, want \"YOU alice\"", got)
+	}
+
+	// Alice sets generic state blob and sends a chat message
+	sendMaskedWSFrame(t, cAlice, "SET online")
+	sendMaskedWSFrame(t, cAlice, "MSG Hello from Alice!")
+
+	// Alice receives her own broadcast chat message from the room
+	if got := readServerWSFrame(t, rAlice); got != "MSG alice Hello from Alice!" {
+		t.Fatalf("alice chat echo = %q, want \"MSG alice Hello from Alice!\"", got)
+	}
+
+	// 2. Bob connects to /ws/chat -> receives YOU bob, Alice's STATE blob, and Alice's chat history
+	cBob, rBob := dialTestWSPath(t, ts.URL, "/ws/chat", "bob", testPass)
+	defer cBob.Close()
+
+	if got := readServerWSFrame(t, rBob); got != "YOU bob" {
+		t.Fatalf("bob greeting = %q, want \"YOU bob\"", got)
+	}
+	if got := readServerWSFrame(t, rBob); got != "STATE alice online" {
+		t.Fatalf("bob state snapshot = %q, want \"STATE alice online\"", got)
+	}
+	if got := readServerWSFrame(t, rBob); got != "MSG alice Hello from Alice!" {
+		t.Fatalf("bob history replay = %q, want \"MSG alice Hello from Alice!\"", got)
+	}
+
+	// 3. Bob announces presence and sends a chat reply -> both Alice and Bob receive it
+	sendMaskedWSFrame(t, cBob, "SET online")
+	if got := readServerWSFrame(t, rAlice); got != "STATE bob online" {
+		t.Fatalf("alice state delta = %q, want \"STATE bob online\"", got)
+	}
+
+	sendMaskedWSFrame(t, cBob, "MSG Hi Alice, Bob here!")
+	if got := readServerWSFrame(t, rAlice); got != "MSG bob Hi Alice, Bob here!" {
+		t.Fatalf("alice chat from bob = %q, want \"MSG bob Hi Alice, Bob here!\"", got)
+	}
+	if got := readServerWSFrame(t, rBob); got != "MSG bob Hi Alice, Bob here!" {
+		t.Fatalf("bob chat echo = %q, want \"MSG bob Hi Alice, Bob here!\"", got)
+	}
+
+	// 4. Verify HTTP GET /ws/chat snapshot includes both states and chat history
+	code, snapBody, _ := doReq(t, http.MethodGet, ts.URL+"/ws/chat", "")
+	if code != http.StatusOK ||
+		!strings.Contains(snapBody, "STATE alice online") ||
+		!strings.Contains(snapBody, "MSG alice Hello from Alice!") ||
+		!strings.Contains(snapBody, "MSG bob Hi Alice, Bob here!") {
+		t.Fatalf("GET /ws/chat = %d %q", code, snapBody)
+	}
+}
+
+
