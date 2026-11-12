@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	testUser = "alice"
-	testPass = "PW123"
+	testUser   = "alice"
+	testPass   = "PW123"
+	testROPass = "RO456"
 )
 
 func TestValidateFSFlag(t *testing.T) {
@@ -555,6 +556,85 @@ func TestGenericRoomAndMultiUserChatWebSocket(t *testing.T) {
 		!strings.Contains(snapBody, "MSG alice Hello from Alice!") ||
 		!strings.Contains(snapBody, "MSG bob Hi Alice, Bob here!") {
 		t.Fatalf("GET /ws/chat = %d %q", code, snapBody)
+	}
+}
+
+func TestReadOnlyPassword(t *testing.T) {
+	tmp := t.TempDir()
+	fsDir := filepath.Join(tmp, "fs") + "/"
+	if err := os.MkdirAll(fsDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	srv, err := NewServer(fsDir, testPass, testROPass)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	var auditBuf bytes.Buffer
+	srv.auditWriter = &auditBuf
+	t.Cleanup(func() { _ = srv.Close() })
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	// 1. Seed initial directory and file using the read-write password
+	code, _, _ := doReqAuth(t, "MKDIR", ts.URL+"/docs", "admin", testPass, "")
+	if code != http.StatusCreated {
+		t.Fatalf("rw MKDIR /docs: got %d, want 201", code)
+	}
+	code, _, _ = doReqAuth(t, http.MethodPut, ts.URL+"/docs/readme.txt", "admin", testPass, "original content")
+	if code != http.StatusCreated {
+		t.Fatalf("rw PUT /docs/readme.txt: got %d, want 201", code)
+	}
+	auditAfterSeed := auditBuf.Len()
+
+	// 2. Read-only password can GET, HEAD, LS, DU, and TIME
+	code, body, _ := doReqAuth(t, http.MethodGet, ts.URL+"/docs/readme.txt", "reader", testROPass, "")
+	if code != http.StatusOK || body != "original content" {
+		t.Fatalf("ro GET /docs/readme.txt: got %d %q, want 200 \"original content\"", code, body)
+	}
+	code, _, _ = doReqAuth(t, http.MethodHead, ts.URL+"/docs/readme.txt", "reader", testROPass, "")
+	if code != http.StatusOK {
+		t.Fatalf("ro HEAD /docs/readme.txt: got %d, want 200", code)
+	}
+	code, body, _ = doReqAuth(t, "LS", ts.URL+"/docs", "reader", testROPass, "")
+	if code != http.StatusOK || !strings.Contains(body, "readme.txt") {
+		t.Fatalf("ro LS /docs: got %d %q, want 200 with readme.txt", code, body)
+	}
+	code, body, _ = doReqAuth(t, "DU", ts.URL+"/docs", "reader", testROPass, "")
+	if code != http.StatusOK || strings.TrimSpace(body) != "16" {
+		t.Fatalf("ro DU /docs: got %d %q, want 200 \"16\"", code, body)
+	}
+	code, _, _ = doReqAuth(t, "TIME", ts.URL+"/", "reader", testROPass, "")
+	if code != http.StatusOK {
+		t.Fatalf("ro TIME /: got %d, want 200", code)
+	}
+
+	// 3. Read-only password CANNOT create, overwrite, or delete files or directories (403 Forbidden)
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPut, "/docs/new.txt", "new file"},
+		{http.MethodPut, "/docs/readme.txt", "overwritten"},
+		{"RM", "/docs/readme.txt", ""},
+		{http.MethodDelete, "/docs/readme.txt", ""},
+		{"MKDIR", "/docs/sub", ""},
+		{"MKCOL", "/docs/sub", ""},
+		{"RMDIR", "/docs", ""},
+	} {
+		code, _, _ := doReqAuth(t, tc.method, ts.URL+tc.path, "reader", testROPass, tc.body)
+		if code != http.StatusForbidden {
+			t.Errorf("ro %s %s: got %d, want %d (403 Forbidden)", tc.method, tc.path, code, http.StatusForbidden)
+		}
+	}
+
+	// 4. Verify file was not overwritten or deleted and no extra audit log entries were written
+	code, body, _ = doReqAuth(t, http.MethodGet, ts.URL+"/docs/readme.txt", "reader", testROPass, "")
+	if code != http.StatusOK || body != "original content" {
+		t.Fatalf("after blocked writes, GET /docs/readme.txt = %d %q, want 200 \"original content\"", code, body)
+	}
+	if auditBuf.Len() != auditAfterSeed {
+		t.Fatalf("expected no audit log entries from blocked read-only requests, got:\n%s", auditBuf.String())
 	}
 }
 

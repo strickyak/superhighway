@@ -15,7 +15,11 @@
 //   - TIME /                 : Return current UTC time ("YYYY-mm-dd HH:MM:SS <unix_seconds>\n")
 //
 // Access requires HTTP Basic Authentication with any short ASCII username
-// (1..32 printable ASCII characters) and the password specified by --password.
+// (1..32 printable ASCII characters) and either the read-write password specified
+// by --password or the optional read-only password specified by --ro-password.
+// Read-only credentials allow GET, HEAD, LS/LIST, DU, TIME, and WebSocket rooms,
+// but forbid mutating filesystem methods (PUT, RM/DELETE, MKDIR/MKCOL, RMDIR)
+// with 403 Forbidden.
 // Authentication failures return "418 I'm a teapot" and are not logged.
 // Changes made to the site (PUT, RM/DELETE, MKDIR/MKCOL, RMDIR) are audit-logged
 // to stderr with timestamp, client IP, username, method, and path.
@@ -46,10 +50,15 @@ import (
 )
 
 var (
-	flagFS       = flag.String("fs", "./fs/", `path to served directory; MUST end with "/fs/" (e.g. "./fs/" or "dirname/fs/")`)
-	flagAddr     = flag.String("addr", ":8080", "HTTP listen address")
-	flagPassword = flag.String("password", "", "required Basic Auth password")
+	flagFS         = flag.String("fs", "./fs/", `path to served directory; MUST end with "/fs/" (e.g. "./fs/" or "dirname/fs/")`)
+	flagAddr       = flag.String("addr", ":8080", "HTTP listen address")
+	flagPassword   = flag.String("password", "", "required Basic Auth password for read-write access")
+	flagROPassword = flag.String("ro-password", "", "optional Basic Auth password for read-only access")
 )
+
+func init() {
+	flag.StringVar(flagROPassword, "read-only-password", "", "alias for --ro-password (optional Basic Auth password for read-only access)")
+}
 
 const timeFormat = "2006-01-02 15:04:05"
 
@@ -160,18 +169,24 @@ func (h *WorldHub) getRoom(name string) *Room {
 type Server struct {
 	root        *os.Root
 	password    string
+	roPassword  string
 	auditMu     sync.Mutex
 	auditWriter io.Writer
 	world       *WorldHub
 }
 
-// NewServer validates fsPath and password, and opens an os.Root confined to that directory.
-func NewServer(fsPath, password string) (*Server, error) {
+// NewServer validates fsPath and password (plus an optional read-only password),
+// and opens an os.Root confined to that directory.
+func NewServer(fsPath, password string, roPassword ...string) (*Server, error) {
 	if err := ValidateFSFlag(fsPath); err != nil {
 		return nil, err
 	}
 	if password == "" {
 		return nil, errors.New("--password must be non-empty")
+	}
+	roPass := ""
+	if len(roPassword) > 0 {
+		roPass = roPassword[0]
 	}
 	info, err := os.Stat(fsPath)
 	if err != nil {
@@ -187,6 +202,7 @@ func NewServer(fsPath, password string) (*Server, error) {
 	return &Server{
 		root:        root,
 		password:    password,
+		roPassword:  roPass,
 		auditWriter: os.Stderr,
 		world:       newWorldHub(),
 	}, nil
@@ -200,7 +216,7 @@ func (s *Server) Close() error {
 	return nil
 }
 
-func (s *Server) authenticate(r *http.Request) (string, bool) {
+func (s *Server) authenticate(r *http.Request) (user string, ok bool, readOnly bool) {
 	user, pass, ok := r.BasicAuth()
 	if !ok {
 		user = r.URL.Query().Get("user")
@@ -208,16 +224,19 @@ func (s *Server) authenticate(r *http.Request) (string, bool) {
 		ok = (user != "" || pass != "")
 	}
 	if !ok {
-		return "", false
+		return "", false, false
 	}
 	user = SanitizeUsername(user)
 	if len(user) < 1 || len(user) > 32 {
-		return "", false
+		return "", false, false
 	}
-	if subtle.ConstantTimeCompare([]byte(pass), []byte(s.password)) != 1 {
-		return "", false
+	if subtle.ConstantTimeCompare([]byte(pass), []byte(s.password)) == 1 {
+		return user, true, false
 	}
-	return user, true
+	if s.roPassword != "" && subtle.ConstantTimeCompare([]byte(pass), []byte(s.roPassword)) == 1 {
+		return user, true, true
+	}
+	return "", false, false
 }
 
 func clientIP(r *http.Request) string {
@@ -262,7 +281,7 @@ func resolveRelPath(urlPath string) (string, error) {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	user, ok := s.authenticate(r)
+	user, ok, readOnly := s.authenticate(r)
 	if !ok {
 		http.Error(w, "418 I'm a teapot", http.StatusTeapot)
 		return
@@ -292,12 +311,28 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "LS", "LIST":
 		s.handleLS(w, r, rel)
 	case http.MethodPut:
+		if readOnly {
+			http.Error(w, "403 Forbidden: read-only access", http.StatusForbidden)
+			return
+		}
 		s.handlePut(w, r, user, rel)
 	case "RM", http.MethodDelete:
+		if readOnly {
+			http.Error(w, "403 Forbidden: read-only access", http.StatusForbidden)
+			return
+		}
 		s.handleRM(w, r, user, rel)
 	case "MKDIR", "MKCOL":
+		if readOnly {
+			http.Error(w, "403 Forbidden: read-only access", http.StatusForbidden)
+			return
+		}
 		s.handleMkdir(w, r, user, rel)
 	case "RMDIR":
+		if readOnly {
+			http.Error(w, "403 Forbidden: read-only access", http.StatusForbidden)
+			return
+		}
 		s.handleRmdir(w, r, user, rel)
 	case "DU":
 		s.handleDU(w, r, rel)
@@ -1028,7 +1063,7 @@ func writeFSError(w http.ResponseWriter, err error) {
 func main() {
 	flag.Parse()
 
-	srv, err := NewServer(*flagFS, *flagPassword)
+	srv, err := NewServer(*flagFS, *flagPassword, *flagROPassword)
 	if err != nil {
 		log.Fatalf("Fatal: %v", err)
 	}

@@ -20,7 +20,9 @@ http://<host>:<port>
 ### 2.2 HTTP Basic Authentication
 Every request must include an HTTP Basic Authentication header (`Authorization: Basic <base64(user:password)>`):
 - **Username**: Any non-empty ASCII string up to 32 characters (`1 <= len(user) <= 32` after deleting any bytes outside `32..126`, excluding `:`). The server records this sanitized username in its stderr CSV audit log (`csv,<timestamp>,<ip>,<user>,<op>,<path>`) whenever a mutating operation (`PUT`, `RM`/`DELETE`, `MKDIR`/`MKCOL`, `RMDIR`) succeeds.
-- **Password**: Must match the server's `--password` flag value.
+- **Password**: Must match either:
+  - the server's `--password` flag value (full read-write access), or
+  - the server's optional `--ro-password` (or `--read-only-password`) flag value (read-only access: allows `GET`, `HEAD`, `LS`/`LIST`, `DU`, `TIME`, and WebSocket rooms, but rejects `PUT`, `RM`/`DELETE`, `MKDIR`/`MKCOL`, and `RMDIR` with `403 Forbidden`).
 - **Authentication Failure**: If credentials are missing, the username is invalid, or the password does not match, the server responds with **`418 I'm a teapot`** (instead of `401 Unauthorized`) and does not log the failed attempt.
 
 ### 2.3 Remote Path Normalization & Escaping
